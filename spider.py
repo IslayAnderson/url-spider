@@ -4,6 +4,8 @@
 Pages are rendered with Selenium, so links added by React, Vue, etc. are picked up.
 """
 import argparse
+import getpass
+import os
 import sys
 import time
 from collections import deque
@@ -31,16 +33,37 @@ return nav && nav.responseStatus ? nav.responseStatus : null;
 """
 
 
-def make_driver(browser, headless):
+def make_driver(browser, headless, bidi):
 	if browser == "chrome":
 		options = webdriver.ChromeOptions()
 		if headless:
 			options.add_argument("--headless=new")
+	else:
+		options = webdriver.FirefoxOptions()
+		if headless:
+			options.add_argument("-headless")
+	options.enable_bidi = bidi
+	if browser == "chrome":
 		return webdriver.Chrome(options=options)
-	options = webdriver.FirefoxOptions()
-	if headless:
-		options.add_argument("-headless")
 	return webdriver.Firefox(options=options)
+
+
+def add_basic_auth(driver, username, password, hosts):
+	"""Answer HTTP auth challenges from the crawled site(s); refuse everyone else."""
+	attempts = {}
+
+	def handler(request):
+		if site(urlparse(request.url).netloc) not in hosts:
+			request.cancel()
+			return
+		# a rejected login re-challenges straight away; don't loop on a wrong password
+		attempts[request.url] = attempts.get(request.url, 0) + 1
+		if attempts[request.url] > 2:
+			request.cancel()
+			return
+		request.provide_credentials(username, password)
+
+	driver.network.add_authentication_handler(handler)
 
 
 def normalise(url):
@@ -75,12 +98,11 @@ def wait_for_links(driver, max_wait, settle):
 	return links or []
 
 
-def crawl(driver, start_urls, max_pages, delay, max_wait, settle, same_host, results):
+def crawl(driver, start_urls, hosts, max_pages, delay, max_wait, settle, same_host, results):
 	queue = deque(normalise(u) for u in start_urls)
 	seen = set(queue)
 	start = set(queue)
 	crawled = set()
-	hosts = {site(urlparse(u).netloc) for u in queue}
 
 	while queue and len(results) < max_pages:
 		url = queue.popleft()
@@ -107,7 +129,8 @@ def crawl(driver, start_urls, max_pages, delay, max_wait, settle, same_host, res
 			crawled.add(url)
 		except WebDriverException as e:
 			results.append((url, "error"))
-			print(f"error  {url} ({e.msg})", file=sys.stderr)
+			reason = "needs a login, use --auth" if "promptUserAndPass" in (e.msg or "") else e.msg
+			print(f"error  {url} ({reason})", file=sys.stderr)
 			continue
 
 		results.append((url, status))
@@ -141,6 +164,8 @@ def main():
 	ap.add_argument("-b", "--browser", choices=("firefox", "chrome"), default="firefox", help="browser to drive (default: firefox)")
 	ap.add_argument("--show", action="store_true", help="show the browser window instead of running headless")
 	ap.add_argument("--status", action="store_true", help="include the HTTP status next to each URL")
+	ap.add_argument("-a", "--auth", metavar="USER[:PASS]", default=os.environ.get("SPIDER_AUTH"),
+		help="HTTP basic auth for the start site(s); prompts for the password if omitted. Also read from $SPIDER_AUTH")
 	ap.add_argument("--all-hosts", action="store_true", help="follow links off the start domain(s)")
 	args = ap.parse_args()
 
@@ -154,10 +179,16 @@ def main():
 	if not start:
 		ap.error("give a start URL, or put one per line in ./urls")
 
+	hosts = {site(urlparse(normalise(u)).netloc) for u in start}
 	results = []
-	driver = make_driver(args.browser, not args.show)
+	driver = make_driver(args.browser, not args.show, bidi=bool(args.auth))
 	try:
-		crawl(driver, start, args.max_pages, args.delay, args.wait, args.settle, not args.all_hosts, results)
+		if args.auth:
+			username, sep, password = args.auth.partition(":")
+			if not sep:
+				password = getpass.getpass(f"Password for {username}: ")
+			add_basic_auth(driver, username, password, hosts)
+		crawl(driver, start, hosts, args.max_pages, args.delay, args.wait, args.settle, not args.all_hosts, results)
 	except KeyboardInterrupt:
 		print("\nstopped, saving what was found so far", file=sys.stderr)
 	finally:

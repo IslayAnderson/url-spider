@@ -35,7 +35,16 @@ Results go to `found_urls.txt`, progress goes to stderr. Ctrl-C stops the crawl 
 | `-b`, `--browser` | `firefox` | `firefox` or `chrome` |
 | `--show` | off | show the browser window instead of headless |
 | `--status` | off | write `status<TAB>url` instead of just the url |
+| `-a`, `--auth` | `$SPIDER_AUTH` | HTTP basic auth as `user:pass`, or `user` to be prompted for the password |
 | `--all-hosts` | off | follow links off the start domain(s) |
+
+### Basic auth
+
+```
+python3 spider.py https://staging.example.com --auth admin
+```
+
+Prompts for the password, so it stays out of your shell history. Credentials are only sent to the start site(s) (plus `www.`/bare variants and wherever the start URL redirects), never to other hosts. A wrong password shows up as a 401 rather than retrying forever.
 
 Follows `<a>`/`<area>` links, skips `rel="nofollow"`, and ignores obvious asset files (images, PDFs, CSS/JS, etc).
 
