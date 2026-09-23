@@ -6,8 +6,12 @@ Pages are rendered in a real headless browser via Selenium, so links generated b
 ## Setup
 
 ```
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+Activate the venv (`source .venv/bin/activate`) in each new shell before running the spider.
 
 Needs Firefox (default) or Chrome installed. Selenium 4 downloads the matching driver automatically.
 
