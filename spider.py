@@ -12,7 +12,7 @@ from collections import deque
 from urllib.parse import urldefrag, urlparse
 
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 SKIP_EXTENSIONS = (
 	".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".avif",
@@ -33,7 +33,7 @@ return nav && nav.responseStatus ? nav.responseStatus : null;
 """
 
 
-def make_driver(browser, headless, bidi):
+def make_driver(browser, headless, bidi, page_timeout):
 	if browser == "chrome":
 		options = webdriver.ChromeOptions()
 		if headless:
@@ -43,9 +43,11 @@ def make_driver(browser, headless, bidi):
 		if headless:
 			options.add_argument("-headless")
 	options.enable_bidi = bidi
-	if browser == "chrome":
-		return webdriver.Chrome(options=options)
-	return webdriver.Firefox(options=options)
+	# don't wait for every image/ad/tracker to finish; wait_for_links handles rendering
+	options.page_load_strategy = "eager"
+	driver = webdriver.Chrome(options=options) if browser == "chrome" else webdriver.Firefox(options=options)
+	driver.set_page_load_timeout(page_timeout)
+	return driver
 
 
 def add_basic_auth(driver, username, password, hosts):
@@ -85,10 +87,10 @@ def wait_for_links(driver, max_wait, settle):
 	"""Wait for the page to load, then until its links stop changing for `settle` seconds.
 	A page with no links yet keeps waiting (up to max_wait) in case the app hasn't rendered."""
 	end = time.time() + max_wait
-	while time.time() < end and driver.execute_script("return document.readyState") != "complete":
+	while time.time() < end and driver.execute_script("return document.readyState") == "loading":
 		time.sleep(0.2)
 	links, stable_since = None, time.time()
-	while time.time() < end:
+	while links is None or time.time() < end:
 		current = driver.execute_script(LINKS_JS)
 		if current != links:
 			links, stable_since = current, time.time()
@@ -98,59 +100,83 @@ def wait_for_links(driver, max_wait, settle):
 	return links or []
 
 
-def crawl(driver, start_urls, hosts, max_pages, delay, max_wait, settle, same_host, results):
+def crawl(new_driver, start_urls, hosts, max_pages, delay, max_wait, settle, same_host, results):
 	queue = deque(normalise(u) for u in start_urls)
 	seen = set(queue)
 	start = set(queue)
 	crawled = set()
+	driver = new_driver()
 
-	while queue and len(results) < max_pages:
-		url = queue.popleft()
-		try:
-			driver.get(url)
-			links = wait_for_links(driver, max_wait, settle)
-			status = driver.execute_script(STATUS_JS) or "-"
-			# read the address once the page has settled, to catch server and client-side redirects
-			final = normalise(driver.current_url)
-			if not final.startswith(("http://", "https://")):
-				final = url
-			if url in start:
-				# follow the site wherever the start URL redirected to
-				hosts.add(site(urlparse(final).netloc))
-			elif same_host and site(urlparse(final).netloc) not in hosts:
-				print(f"skip   {url} (redirects off-site)", file=sys.stderr)
-				continue
-			if final != url:
-				# redirected: record the page under where it landed, once
-				if final in crawled:
+	try:
+		while queue and len(results) < max_pages:
+			url = queue.popleft()
+			try:
+				# tag the current page so we can tell if the next one never replaced it
+				driver.execute_script("window.__spiderOld = true;")
+				try:
+					driver.get(url)
+				except TimeoutException:
+					# page is still loading something; stop it and use what's there
+					driver.execute_script("window.stop();")
+					if driver.execute_script("return window.__spiderOld === true;"):
+						results.append((url, "timeout"))
+						print(f"timeout {url} (no response)", file=sys.stderr)
+						continue
+				links = wait_for_links(driver, max_wait, settle)
+				status = driver.execute_script(STATUS_JS) or "-"
+				# read the address once the page has settled, to catch server and client-side redirects
+				final = normalise(driver.current_url)
+				if not final.startswith(("http://", "https://")):
+					final = url
+				if url in start:
+					# follow the site wherever the start URL redirected to
+					hosts.add(site(urlparse(final).netloc))
+				elif same_host and site(urlparse(final).netloc) not in hosts:
+					print(f"skip   {url} (redirects off-site)", file=sys.stderr)
 					continue
-				seen.add(final)
-				url = final
-			crawled.add(url)
-		except WebDriverException as e:
-			results.append((url, "error"))
-			reason = "needs a login, use --auth" if "promptUserAndPass" in (e.msg or "") else e.msg
-			print(f"error  {url} ({reason})", file=sys.stderr)
-			continue
-
-		results.append((url, status))
-		print(f"{status}    {url}  ({len(links)} links)", file=sys.stderr)
-
-		for href in links:
-			link = normalise(href)
-			parts = urlparse(link)
-			if parts.scheme not in ("http", "https"):
+				if final != url:
+					# redirected: record the page under where it landed, once
+					if final in crawled:
+						continue
+					seen.add(final)
+					url = final
+				crawled.add(url)
+			except WebDriverException as e:
+				results.append((url, "error"))
+				reason = "needs a login, use --auth" if "promptUserAndPass" in (e.msg or "") else e.msg
+				print(f"error  {url} ({reason})", file=sys.stderr)
 				continue
-			if same_host and site(parts.netloc) not in hosts:
+			except Exception as e:
+				# the browser itself stopped responding: replace it and carry on
+				results.append((url, "error"))
+				print(f"error  {url} (browser hung: {type(e).__name__}), restarting browser", file=sys.stderr)
+				try:
+					driver.quit()
+				except Exception:
+					pass
+				driver = new_driver()
 				continue
-			if parts.path.lower().endswith(SKIP_EXTENSIONS):
-				continue
-			if link not in seen:
-				seen.add(link)
-				queue.append(link)
 
-		if delay:
-			time.sleep(delay)
+			results.append((url, status))
+			print(f"{status}    {url}  ({len(links)} links)", file=sys.stderr)
+
+			for href in links:
+				link = normalise(href)
+				parts = urlparse(link)
+				if parts.scheme not in ("http", "https"):
+					continue
+				if same_host and site(parts.netloc) not in hosts:
+					continue
+				if parts.path.lower().endswith(SKIP_EXTENSIONS):
+					continue
+				if link not in seen:
+					seen.add(link)
+					queue.append(link)
+
+			if delay:
+				time.sleep(delay)
+	finally:
+		driver.quit()
 
 
 def main():
@@ -160,6 +186,7 @@ def main():
 	ap.add_argument("-m", "--max-pages", type=int, default=500, help="stop after this many pages (default: 500)")
 	ap.add_argument("-d", "--delay", type=float, default=0, help="extra seconds between pages (default: 0)")
 	ap.add_argument("-w", "--wait", type=float, default=10, help="max seconds to wait for a page to render (default: 10)")
+	ap.add_argument("-p", "--page-timeout", type=float, default=30, help="max seconds for a page to load before it's stopped (default: 30)")
 	ap.add_argument("-s", "--settle", type=float, default=1.5, help="seconds the links must stay unchanged before moving on (default: 1.5)")
 	ap.add_argument("-b", "--browser", choices=("firefox", "chrome"), default="firefox", help="browser to drive (default: firefox)")
 	ap.add_argument("--show", action="store_true", help="show the browser window instead of running headless")
@@ -180,19 +207,23 @@ def main():
 		ap.error("give a start URL, or put one per line in ./urls")
 
 	hosts = {site(urlparse(normalise(u)).netloc) for u in start}
-	results = []
-	driver = make_driver(args.browser, not args.show, bidi=bool(args.auth))
-	try:
+	password = None
+	if args.auth:
+		username, sep, password = args.auth.partition(":")
+		if not sep:
+			password = getpass.getpass(f"Password for {username}: ")
+
+	def new_driver():
+		driver = make_driver(args.browser, not args.show, bool(args.auth), args.page_timeout)
 		if args.auth:
-			username, sep, password = args.auth.partition(":")
-			if not sep:
-				password = getpass.getpass(f"Password for {username}: ")
 			add_basic_auth(driver, username, password, hosts)
-		crawl(driver, start, hosts, args.max_pages, args.delay, args.wait, args.settle, not args.all_hosts, results)
+		return driver
+
+	results = []
+	try:
+		crawl(new_driver, start, hosts, args.max_pages, args.delay, args.wait, args.settle, not args.all_hosts, results)
 	except KeyboardInterrupt:
 		print("\nstopped, saving what was found so far", file=sys.stderr)
-	finally:
-		driver.quit()
 
 	with open(args.output, "w") as f:
 		for url, status in results:

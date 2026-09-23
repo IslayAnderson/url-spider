@@ -23,13 +23,14 @@ python3 spider.py https://example.com
 
 Or put start URLs in `urls` (one per line) and run `python3 spider.py`.
 
-Results go to `found_urls.txt`, progress goes to stderr. Ctrl-C stops the crawl and still saves what was found.
+Results go to `found_urls.txt`, progress goes to stderr. Ctrl-C stops the crawl and still saves what was found. Pages that never respond are listed as `timeout`, and if the browser itself locks up it's restarted and the crawl carries on.
 
 | Option | Default | |
 |---|---|---|
 | `-o`, `--output` | `found_urls.txt` | output file |
 | `-m`, `--max-pages` | `500` | stop after this many pages |
 | `-w`, `--wait` | `10` | max seconds to wait for a page to render |
+| `-p`, `--page-timeout` | `30` | max seconds for a page to load; slower pages are stopped and whatever rendered is used |
 | `-s`, `--settle` | `1.5` | seconds the page's links must stop changing before moving on |
 | `-d`, `--delay` | `0` | extra seconds between pages |
 | `-b`, `--browser` | `firefox` | `firefox` or `chrome` |
