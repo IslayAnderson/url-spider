@@ -53,6 +53,11 @@ def normalise(url):
 	return url
 
 
+def site(netloc):
+	# treat www.example.com and example.com as the same site
+	return netloc[4:] if netloc.startswith("www.") else netloc
+
+
 def wait_for_links(driver, max_wait, settle):
 	"""Wait for the page to load, then until its links stop changing for `settle` seconds.
 	A page with no links yet keeps waiting (up to max_wait) in case the app hasn't rendered."""
@@ -73,7 +78,9 @@ def wait_for_links(driver, max_wait, settle):
 def crawl(driver, start_urls, max_pages, delay, max_wait, settle, same_host, results):
 	queue = deque(normalise(u) for u in start_urls)
 	seen = set(queue)
-	hosts = {urlparse(u).netloc for u in queue}
+	start = set(queue)
+	crawled = set()
+	hosts = {site(urlparse(u).netloc) for u in queue}
 
 	while queue and len(results) < max_pages:
 		url = queue.popleft()
@@ -81,6 +88,23 @@ def crawl(driver, start_urls, max_pages, delay, max_wait, settle, same_host, res
 			driver.get(url)
 			links = wait_for_links(driver, max_wait, settle)
 			status = driver.execute_script(STATUS_JS) or "-"
+			# read the address once the page has settled, to catch server and client-side redirects
+			final = normalise(driver.current_url)
+			if not final.startswith(("http://", "https://")):
+				final = url
+			if url in start:
+				# follow the site wherever the start URL redirected to
+				hosts.add(site(urlparse(final).netloc))
+			elif same_host and site(urlparse(final).netloc) not in hosts:
+				print(f"skip   {url} (redirects off-site)", file=sys.stderr)
+				continue
+			if final != url:
+				# redirected: record the page under where it landed, once
+				if final in crawled:
+					continue
+				seen.add(final)
+				url = final
+			crawled.add(url)
 		except WebDriverException as e:
 			results.append((url, "error"))
 			print(f"error  {url} ({e.msg})", file=sys.stderr)
@@ -94,7 +118,7 @@ def crawl(driver, start_urls, max_pages, delay, max_wait, settle, same_host, res
 			parts = urlparse(link)
 			if parts.scheme not in ("http", "https"):
 				continue
-			if same_host and parts.netloc not in hosts:
+			if same_host and site(parts.netloc) not in hosts:
 				continue
 			if parts.path.lower().endswith(SKIP_EXTENSIONS):
 				continue
