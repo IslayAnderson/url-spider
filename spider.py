@@ -17,14 +17,45 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 SKIP_EXTENSIONS = (
 	".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".avif",
 	".pdf", ".zip", ".gz", ".mp3", ".mp4", ".mov", ".webm", ".woff", ".woff2",
-	".css", ".js", ".xml", ".json", ".txt",
+	".css", ".js", ".json", ".txt",
 )
 
-# a.href / area.href are already resolved to absolute URLs by the browser
-LINKS_JS = """
+# Sitemaps list URLs in <loc>, RSS in <link>text</link>, Atom and hreflang
+# alternates in <link href="">.
+XML_URLS_JS = """
+function xmlUrls(doc, base) {
+	const urls = [];
+	for (const el of doc.getElementsByTagName('*')) {
+		if (el.localName === 'loc') urls.push(el.textContent.trim());
+		else if (el.localName === 'link') urls.push(el.getAttribute('href') || el.textContent.trim());
+	}
+	return urls.filter(Boolean).map(u => {
+		try { return new URL(u, base).href; } catch (e) { return null; }
+	}).filter(Boolean);
+}
+"""
+
+# HTML: a.href / area.href are already resolved to absolute URLs by the browser.
+LINKS_JS = XML_URLS_JS + """
+const type = document.contentType || '';
+if (type.includes('xml') && !type.includes('html')) return xmlUrls(document, document.baseURI);
 return Array.from(document.querySelectorAll('a[href], area[href]'))
 	.filter(a => !(a.rel || '').toLowerCase().includes('nofollow'))
 	.map(a => a.href);
+"""
+
+# Feeds served as application/rss+xml etc. get downloaded rather than displayed,
+# so fetch XML from inside the page instead (keeps cookies and basic auth).
+FETCH_XML_JS = XML_URLS_JS + """
+const [url, timeoutMs, done] = arguments;
+const ctrl = new AbortController();
+setTimeout(() => ctrl.abort(), timeoutMs);
+fetch(url, {credentials: 'include', signal: ctrl.signal}).then(async r => {
+	const type = r.headers.get('content-type') || '';
+	if (!type.includes('xml') || type.includes('html')) return done(null);
+	const doc = new DOMParser().parseFromString(await r.text(), 'application/xml');
+	done({status: r.status, url: r.url, links: xmlUrls(doc, r.url)});
+}).catch(() => done(null));
 """
 
 STATUS_JS = """
@@ -47,6 +78,7 @@ def make_driver(browser, headless, bidi, page_timeout):
 	options.page_load_strategy = "eager"
 	driver = webdriver.Chrome(options=options) if browser == "chrome" else webdriver.Firefox(options=options)
 	driver.set_page_load_timeout(page_timeout)
+	driver.set_script_timeout(page_timeout + 5)
 	return driver
 
 
@@ -83,6 +115,40 @@ def site(netloc):
 	return netloc[4:] if netloc.startswith("www.") else netloc
 
 
+def looks_like_xml(url):
+	path = urlparse(url).path.lower()
+	last = path.rstrip("/").rsplit("/", 1)[-1]
+	return path.endswith(".xml") or last in ("feed", "rss", "atom")
+
+
+def fetch_xml(driver, url, page_timeout):
+	"""Fetch an XML document from inside the browser; None if it isn't XML or can't be fetched."""
+	return driver.execute_async_script(FETCH_XML_JS, url, int(page_timeout * 1000))
+
+
+def load(driver, url, page_timeout, max_wait, settle):
+	"""Open a URL; returns (status, final url, links), or None if it never responded."""
+	if looks_like_xml(url):
+		data = fetch_xml(driver, url, page_timeout)
+		if data:
+			return data["status"], data["url"], data["links"]
+	# tag the current page so we can tell if the next one never replaced it
+	driver.execute_script("window.__spiderOld = true;")
+	try:
+		driver.get(url)
+	except TimeoutException:
+		# page is still loading something; stop it and use what's there
+		driver.execute_script("window.stop();")
+		if driver.execute_script("return window.__spiderOld === true;"):
+			# never displayed: may be a download-type XML file, else it's dead
+			data = fetch_xml(driver, url, page_timeout)
+			return (data["status"], data["url"], data["links"]) if data else None
+	links = wait_for_links(driver, max_wait, settle)
+	status = driver.execute_script(STATUS_JS) or "-"
+	# read the address once the page has settled, to catch server and client-side redirects
+	return status, driver.current_url, links
+
+
 def wait_for_links(driver, max_wait, settle):
 	"""Wait for the page to load, then until its links stop changing for `settle` seconds.
 	A page with no links yet keeps waiting (up to max_wait) in case the app hasn't rendered."""
@@ -100,7 +166,7 @@ def wait_for_links(driver, max_wait, settle):
 	return links or []
 
 
-def crawl(new_driver, start_urls, hosts, max_pages, delay, max_wait, settle, same_host, results):
+def crawl(new_driver, start_urls, hosts, max_pages, delay, page_timeout, max_wait, settle, same_host, results):
 	queue = deque(normalise(u) for u in start_urls)
 	seen = set(queue)
 	start = set(queue)
@@ -111,21 +177,13 @@ def crawl(new_driver, start_urls, hosts, max_pages, delay, max_wait, settle, sam
 		while queue and len(results) < max_pages:
 			url = queue.popleft()
 			try:
-				# tag the current page so we can tell if the next one never replaced it
-				driver.execute_script("window.__spiderOld = true;")
-				try:
-					driver.get(url)
-				except TimeoutException:
-					# page is still loading something; stop it and use what's there
-					driver.execute_script("window.stop();")
-					if driver.execute_script("return window.__spiderOld === true;"):
-						results.append((url, "timeout"))
-						print(f"timeout {url} (no response)", file=sys.stderr)
-						continue
-				links = wait_for_links(driver, max_wait, settle)
-				status = driver.execute_script(STATUS_JS) or "-"
-				# read the address once the page has settled, to catch server and client-side redirects
-				final = normalise(driver.current_url)
+				loaded = load(driver, url, page_timeout, max_wait, settle)
+				if loaded is None:
+					results.append((url, "timeout"))
+					print(f"timeout {url} (no response)", file=sys.stderr)
+					continue
+				status, final, links = loaded
+				final = normalise(final)
 				if not final.startswith(("http://", "https://")):
 					final = url
 				if url in start:
@@ -221,7 +279,7 @@ def main():
 
 	results = []
 	try:
-		crawl(new_driver, start, hosts, args.max_pages, args.delay, args.wait, args.settle, not args.all_hosts, results)
+		crawl(new_driver, start, hosts, args.max_pages, args.delay, args.page_timeout, args.wait, args.settle, not args.all_hosts, results)
 	except KeyboardInterrupt:
 		print("\nstopped, saving what was found so far", file=sys.stderr)
 

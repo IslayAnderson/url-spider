@@ -49,4 +49,6 @@ Prompts for the password, so it stays out of your shell history. Credentials are
 
 Follows `<a>`/`<area>` links, skips `rel="nofollow"`, and ignores obvious asset files (images, PDFs, CSS/JS, etc).
 
+XML is followed too: sitemaps and sitemap indexes (`<loc>`, including hreflang alternates), RSS (`<link>`) and Atom (`<link href>`). So `python3 spider.py https://example.com/sitemap.xml` crawls everything in the sitemap, including pages nothing links to. Feeds that the browser would download instead of display (`application/rss+xml` etc) are fetched from inside the browser, so cookies and `--auth` still apply.
+
 use and abuse my code ¯\_(ツ)_/¯
