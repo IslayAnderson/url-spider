@@ -23,6 +23,8 @@ python3 spider.py https://example.com
 
 Or put start URLs in `urls` (one per line) and run `python3 spider.py`.
 
+Pages are crawled by several browsers at once (`-j`, default 4). Each is a full Firefox/Chrome, so budget roughly 300MB of RAM per worker, and go easy on sites you don't own.
+
 Results go to `found_urls.txt`, progress goes to stderr. Ctrl-C stops the crawl and still saves what was found. Pages that never respond are listed as `timeout`, and if the browser itself locks up it's restarted and the crawl carries on.
 
 | Option | Default | |
@@ -32,7 +34,8 @@ Results go to `found_urls.txt`, progress goes to stderr. Ctrl-C stops the crawl 
 | `-w`, `--wait` | `10` | max seconds to wait for a page to render |
 | `-p`, `--page-timeout` | `30` | max seconds for a page to load; slower pages are stopped and whatever rendered is used |
 | `-s`, `--settle` | `1.5` | seconds the page's links must stop changing before moving on |
-| `-d`, `--delay` | `0` | extra seconds between pages |
+| `-j`, `--workers` | `4` | browsers crawling in parallel, one thread each |
+| `-d`, `--delay` | `0` | extra seconds each worker waits between pages |
 | `-b`, `--browser` | `firefox` | `firefox` or `chrome` |
 | `--show` | off | show the browser window instead of headless |
 | `--status` | off | write `status<TAB>url` instead of just the url |

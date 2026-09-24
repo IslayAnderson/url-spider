@@ -2,11 +2,13 @@
 """Crawl a website in a real (headless) browser and list every URL found on it.
 
 Pages are rendered with Selenium, so links added by React, Vue, etc. are picked up.
+Several browsers run in parallel (--workers), each in its own thread.
 """
 import argparse
 import getpass
 import os
 import sys
+import threading
 import time
 from collections import deque
 from urllib.parse import urldefrag, urlparse
@@ -123,6 +125,15 @@ def looks_like_xml(url):
 
 def fetch_xml(driver, url, page_timeout):
 	"""Fetch an XML document from inside the browser; None if it isn't XML or can't be fetched."""
+	parts = urlparse(url)
+	origin = f"{parts.scheme}://{parts.netloc}"
+	if driver.execute_script("return location.origin;") != origin:
+		# fetch() only works same-origin (a fresh browser sits on about:blank), so
+		# stand on a cheap page of that site first
+		try:
+			driver.get(origin + "/robots.txt")
+		except TimeoutException:
+			driver.execute_script("window.stop();")
 	return driver.execute_async_script(FETCH_XML_JS, url, int(page_timeout * 1000))
 
 
@@ -166,75 +177,169 @@ def wait_for_links(driver, max_wait, settle):
 	return links or []
 
 
-def crawl(new_driver, start_urls, hosts, max_pages, delay, page_timeout, max_wait, settle, same_host, results):
-	queue = deque(normalise(u) for u in start_urls)
-	seen = set(queue)
-	start = set(queue)
-	crawled = set()
-	driver = new_driver()
+class Crawler:
+	"""Crawls with several browsers at once, one per worker thread, sharing one queue."""
 
-	try:
-		while queue and len(results) < max_pages:
-			url = queue.popleft()
-			try:
-				loaded = load(driver, url, page_timeout, max_wait, settle)
-				if loaded is None:
-					results.append((url, "timeout"))
-					print(f"timeout {url} (no response)", file=sys.stderr)
-					continue
-				status, final, links = loaded
-				final = normalise(final)
-				if not final.startswith(("http://", "https://")):
-					final = url
-				if url in start:
-					# follow the site wherever the start URL redirected to
-					hosts.add(site(urlparse(final).netloc))
-				elif same_host and site(urlparse(final).netloc) not in hosts:
-					print(f"skip   {url} (redirects off-site)", file=sys.stderr)
-					continue
-				if final != url:
-					# redirected: record the page under where it landed, once
-					if final in crawled:
-						continue
-					seen.add(final)
-					url = final
-				crawled.add(url)
-			except WebDriverException as e:
-				results.append((url, "error"))
-				reason = "needs a login, use --auth" if "promptUserAndPass" in (e.msg or "") else e.msg
-				print(f"error  {url} ({reason})", file=sys.stderr)
-				continue
-			except Exception as e:
-				# the browser itself stopped responding: replace it and carry on
-				results.append((url, "error"))
-				print(f"error  {url} (browser hung: {type(e).__name__}), restarting browser", file=sys.stderr)
+	def __init__(self, new_driver, start_urls, hosts, max_pages, delay, page_timeout, max_wait, settle, same_host):
+		self.new_driver = new_driver
+		self.queue = deque(normalise(u) for u in start_urls)
+		self.seen = set(self.queue)
+		self.start = set(self.queue)
+		self.crawled = set()
+		self.hosts = hosts
+		self.results = []
+		self.max_pages = max_pages
+		self.delay = delay
+		self.page_timeout = page_timeout
+		self.max_wait = max_wait
+		self.settle = settle
+		self.same_host = same_host
+		self.in_flight = 0
+		self.stopping = False
+		self.cond = threading.Condition()
+		self.drivers = set()
+		self.retried = set()
+
+	def run(self, workers):
+		threads = [threading.Thread(target=self.worker, daemon=True) for _ in range(workers)]
+		for t in threads:
+			t.start()
+		try:
+			# join with a timeout so Ctrl-C reaches the main thread
+			while any(t.is_alive() for t in threads):
+				for t in threads:
+					t.join(0.5)
+		except KeyboardInterrupt:
+			with self.cond:
+				self.stopping = True
+				self.cond.notify_all()
+				drivers = list(self.drivers)
+			# workers are daemon threads and die with the process, so close their browsers here
+			for driver in drivers:
 				try:
 					driver.quit()
 				except Exception:
 					pass
-				driver = new_driver()
-				continue
+			raise
 
-			results.append((url, status))
-			print(f"{status}    {url}  ({len(links)} links)", file=sys.stderr)
+	def open_driver(self):
+		driver = self.new_driver()
+		with self.cond:
+			self.drivers.add(driver)
+		return driver
+
+	def close_driver(self, driver):
+		with self.cond:
+			self.drivers.discard(driver)
+		try:
+			driver.quit()
+		except Exception:
+			pass
+
+	def log(self, msg):
+		print(msg, file=sys.stderr, flush=True)
+
+	def next_url(self):
+		with self.cond:
+			while True:
+				if self.stopping:
+					return None
+				full = len(self.results) + self.in_flight >= self.max_pages
+				if self.queue and not full:
+					self.in_flight += 1
+					return self.queue.popleft()
+				# nothing to hand out: finished if no one else can add more
+				if self.in_flight == 0 or (full and not self.queue):
+					self.cond.notify_all()
+					return None
+				self.cond.wait()
+
+	def worker(self):
+		try:
+			driver = self.open_driver()
+		except Exception as e:
+			self.log(f"error  couldn't start browser ({e})")
+			return
+		try:
+			while (url := self.next_url()) is not None:
+				try:
+					driver = self.visit(driver, url)
+				finally:
+					with self.cond:
+						self.in_flight -= 1
+						self.cond.notify_all()
+				if self.delay:
+					time.sleep(self.delay)
+		finally:
+			self.close_driver(driver)
+
+	def visit(self, driver, url):
+		"""Load one page and record it. Returns the driver to keep using (replaced if it hung)."""
+		try:
+			loaded = load(driver, url, self.page_timeout, self.max_wait, self.settle)
+		except WebDriverException as e:
+			reason = "needs a login, use --auth" if "promptUserAndPass" in (e.msg or "") else e.msg
+			self.record(url, "error", f"error  {url} ({reason})")
+			return driver
+		except Exception as e:
+			if self.stopping:
+				return driver
+			# the browser itself stopped responding: replace it, and give the page one more go
+			with self.cond:
+				if url in self.retried:
+					self.results.append((url, "error"))
+					self.log(f"error  {url} (browser hung again: {type(e).__name__}), restarting browser")
+				else:
+					self.retried.add(url)
+					self.queue.appendleft(url)
+					self.log(f"retry  {url} (browser hung: {type(e).__name__}), restarting browser")
+			self.close_driver(driver)
+			return self.open_driver()
+
+		if loaded is None:
+			self.record(url, "timeout", f"timeout {url} (no response)")
+			return driver
+
+		status, final, links = loaded
+		final = normalise(final)
+		if not final.startswith(("http://", "https://")):
+			final = url
+
+		with self.cond:
+			if url in self.start:
+				# follow the site wherever the start URL redirected to
+				self.hosts.add(site(urlparse(final).netloc))
+			elif self.same_host and site(urlparse(final).netloc) not in self.hosts:
+				self.log(f"skip   {url} (redirects off-site)")
+				return driver
+			if final != url:
+				# redirected: record the page under where it landed, once
+				if final in self.crawled:
+					return driver
+				self.seen.add(final)
+				url = final
+			self.crawled.add(url)
+			self.results.append((url, status))
+			self.log(f"{status}    {url}  ({len(links)} links)")
 
 			for href in links:
 				link = normalise(href)
 				parts = urlparse(link)
 				if parts.scheme not in ("http", "https"):
 					continue
-				if same_host and site(parts.netloc) not in hosts:
+				if self.same_host and site(parts.netloc) not in self.hosts:
 					continue
 				if parts.path.lower().endswith(SKIP_EXTENSIONS):
 					continue
-				if link not in seen:
-					seen.add(link)
-					queue.append(link)
+				if link not in self.seen:
+					self.seen.add(link)
+					self.queue.append(link)
+		return driver
 
-			if delay:
-				time.sleep(delay)
-	finally:
-		driver.quit()
+	def record(self, url, status, msg):
+		with self.cond:
+			self.results.append((url, status))
+			self.log(msg)
 
 
 def main():
@@ -242,7 +347,8 @@ def main():
 	ap.add_argument("urls", nargs="*", help="start URL(s); defaults to the lines in ./urls")
 	ap.add_argument("-o", "--output", default="found_urls.txt", help="output file (default: found_urls.txt)")
 	ap.add_argument("-m", "--max-pages", type=int, default=500, help="stop after this many pages (default: 500)")
-	ap.add_argument("-d", "--delay", type=float, default=0, help="extra seconds between pages (default: 0)")
+	ap.add_argument("-j", "--workers", type=int, default=4, help="browsers to run in parallel (default: 4)")
+	ap.add_argument("-d", "--delay", type=float, default=0, help="extra seconds each worker waits between pages (default: 0)")
 	ap.add_argument("-w", "--wait", type=float, default=10, help="max seconds to wait for a page to render (default: 10)")
 	ap.add_argument("-p", "--page-timeout", type=float, default=30, help="max seconds for a page to load before it's stopped (default: 30)")
 	ap.add_argument("-s", "--settle", type=float, default=1.5, help="seconds the links must stay unchanged before moving on (default: 1.5)")
@@ -277,11 +383,14 @@ def main():
 			add_basic_auth(driver, username, password, hosts)
 		return driver
 
-	results = []
+	crawler = Crawler(new_driver, start, hosts, args.max_pages, args.delay, args.page_timeout,
+		args.wait, args.settle, not args.all_hosts)
 	try:
-		crawl(new_driver, start, hosts, args.max_pages, args.delay, args.page_timeout, args.wait, args.settle, not args.all_hosts, results)
+		crawler.run(max(1, args.workers))
 	except KeyboardInterrupt:
 		print("\nstopped, saving what was found so far", file=sys.stderr)
+	with crawler.cond:
+		results = list(crawler.results)
 
 	with open(args.output, "w") as f:
 		for url, status in results:
